@@ -1,13 +1,22 @@
 /**
- * 连戏差异 store：维护差异列表、严重程度筛选与解决状态流转。
+ * 连戏差异 store：维护差异列表、严重程度筛选、待重算留档与确认重算。
+ * 版本链：差异按要素记代次（version + supersedes），旧结论标「待重算」留档、不参与统计；
+ * 确认重算在事务内生成新一代差异，失败整体回滚。
  */
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import type { LocationQuery } from 'vue-router'
 import type { Conflict } from '@/types/conflict'
 import type { FilterModel } from '@/types/filter'
-import type { ConflictRow } from '@/utils/db'
-import { putConflict, removeConflict, reopenConflict, resolveConflict, saveConflicts, ROW_REVISION } from '@/utils/db'
+import type { RecalcResult } from '@/utils/db'
+import {
+  putConflict,
+  recalculateConflicts,
+  removeConflict,
+  reopenConflict,
+  resolveConflict,
+  ROW_REVISION
+} from '@/utils/db'
 import { createId } from '@/utils/uuid'
 import { queryToFilters } from '@/utils/query'
 import type { DiffCandidate } from '@/hooks/useContinuityDiff'
@@ -16,7 +25,8 @@ export const CONFLICT_FILTER_KEYS = ['severities', 'states']
 
 export const useConflictStore = defineStore('conflict', () => {
   const filters = ref<FilterModel>({ keyword: '', severities: [], states: [] })
-  const lastGenerated = ref<number>(0)
+  /** 最近一次重算结果（供页面提示） */
+  const lastRecalc = ref<RecalcResult | null>(null)
 
   function setFilters(next: FilterModel): void {
     filters.value = next
@@ -30,26 +40,24 @@ export const useConflictStore = defineStore('conflict', () => {
     filters.value = queryToFilters(query, CONFLICT_FILTER_KEYS)
   }
 
-  /** 由比对候选生成差异条目（已存在的同一对记录不会重复生成） */
-  async function generate(candidates: DiffCandidate[]): Promise<number> {
-    const now = Date.now()
-    const rows: ConflictRow[] = candidates.map((item) => ({
-      id: createId('conflict'),
-      elementId: item.elementId,
-      recordIdA: item.a.id,
-      recordIdB: item.b.id,
-      diffDesc: item.desc,
-      severity: item.severity,
-      state: '待确认',
-      resolvedNote: '',
-      resolvedAt: '',
-      revision: ROW_REVISION,
-      createdAt: now,
-      updatedAt: now
-    }))
-    const created = await saveConflicts(rows)
-    lastGenerated.value = created
-    return created
+  /**
+   * 确认重算：由比对候选生成新一代差异。
+   * 事务内执行，记录版本不一致会抛 VersionConflictError 并整体回滚。
+   */
+  async function recalculate(candidates: DiffCandidate[]): Promise<RecalcResult> {
+    const result = await recalculateConflicts(
+      candidates.map((item) => ({
+        elementId: item.elementId,
+        recordIdA: item.a.id,
+        recordIdB: item.b.id,
+        diffDesc: item.desc,
+        severity: item.severity,
+        recordARevision: item.a.revision,
+        recordBRevision: item.b.revision
+      }))
+    )
+    lastRecalc.value = result
+    return result
   }
 
   /** 手工登记一条差异（用于现场口头发现的偏差） */
@@ -61,6 +69,11 @@ export const useConflictStore = defineStore('conflict', () => {
       id,
       resolvedNote: '',
       resolvedAt: '',
+      version: 1,
+      supersedes: '',
+      supersededBy: '',
+      recalcReason: '',
+      recalcDone: false,
       revision: ROW_REVISION,
       createdAt: now,
       updatedAt: now
@@ -68,18 +81,23 @@ export const useConflictStore = defineStore('conflict', () => {
     return id
   }
 
-  /** 解决差异：写入留痕并回写要素初始状态 */
-  async function resolve(id: string, note: string): Promise<void> {
-    await resolveConflict(id, note)
+  /** 解决差异（乐观锁）：写入留痕并回写要素初始状态，登记新一代要素基准 */
+  async function resolve(
+    id: string,
+    note: string,
+    expected?: { conflictRevision?: number; elementRevision?: number }
+  ): Promise<void> {
+    await resolveConflict(id, note, expected)
   }
 
-  async function reopen(id: string): Promise<void> {
-    await reopenConflict(id)
+  /** 重新打开差异（误判回退，乐观锁） */
+  async function reopen(id: string, expectedRevision?: number): Promise<void> {
+    await reopenConflict(id, expectedRevision)
   }
 
   async function remove(id: string): Promise<void> {
     await removeConflict(id)
   }
 
-  return { filters, lastGenerated, setFilters, resetFilters, applyQuery, generate, createManual, resolve, reopen, remove }
+  return { filters, lastRecalc, setFilters, resetFilters, applyQuery, recalculate, createManual, resolve, reopen, remove }
 })

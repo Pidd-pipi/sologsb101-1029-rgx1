@@ -5,7 +5,7 @@
  */
 import { computed } from 'vue'
 import type { Component } from 'vue'
-import { CircleCheck, Clock, Flag, WarningFilled } from '@element-plus/icons-vue'
+import { CircleCheck, Clock, Flag, RefreshLeft, WarningFilled } from '@element-plus/icons-vue'
 
 type Tone = 'primary' | 'success' | 'warning' | 'danger' | 'info'
 
@@ -33,6 +33,7 @@ const STYLES: Record<string, TagStyle> = {
   阻断: { tone: 'danger', icon: WarningFilled, color: '#c0392b' },
   待确认: { tone: 'warning', icon: Clock, color: '#d68910' },
   已解决: { tone: 'success', icon: CircleCheck, color: '#1e8449' },
+  待重算: { tone: 'info', icon: RefreshLeft, color: '#9aa5ad' },
   未拍: { tone: 'info', icon: Clock, color: '#6b7c8c' },
   拍摄中: { tone: 'warning', icon: Flag, color: '#d68910' },
   已过: { tone: 'success', icon: CircleCheck, color: '#1e8449' }

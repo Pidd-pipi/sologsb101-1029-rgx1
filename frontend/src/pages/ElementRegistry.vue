@@ -7,7 +7,7 @@ import { Plus } from '@element-plus/icons-vue'
 import FilterBar from '@/components/common/FilterBar.vue'
 import StatBadge from '@/components/common/StatBadge.vue'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
-import { db, type ElementRow, type RecordRow, type SceneRow } from '@/utils/db'
+import { db, type BaselineVersionRow, type ElementRow, type RecordRow, type SceneRow } from '@/utils/db'
 import { useIdbTable } from '@/hooks/useIdbTable'
 import { useElementStore } from '@/stores/elementStore'
 import { ELEMENT_CATEGORIES, createEmptyElement, type Element, type ElementCategory } from '@/types/element'
@@ -24,6 +24,14 @@ const { rows: elements, ready } = useIdbTable<ElementRow>(() => db.elements, {
 })
 const { rows: scenes } = useIdbTable<SceneRow>(() => db.scenes, { compare: (a, b) => a.shootOrder - b.shootOrder })
 const { rows: records } = useIdbTable<RecordRow>(() => db.records)
+const { rows: baselineVersions } = useIdbTable<BaselineVersionRow>(() => db.baselineVersions)
+
+/** 某要素的基准版本链（按代次倒序） */
+function baselineVersionsOf(elementId: string): BaselineVersionRow[] {
+  return baselineVersions.value
+    .filter((item) => item.elementId === elementId)
+    .sort((a, b) => b.version - a.version)
+}
 
 const selects = computed<FilterSelectConfig[]>(() => [
   { key: 'categories', label: '类别', options: ELEMENT_CATEGORIES.map((item) => ({ label: item, value: item })) },
@@ -97,6 +105,8 @@ const totals = computed(() => {
 /* ------------------------------ 新增 / 编辑 ------------------------------ */
 const dialogVisible = ref(false)
 const editingId = ref<string | null>(null)
+/** 打开编辑时读到的行版本（乐观锁令牌，保存时原样带回） */
+const editingRevision = ref<number>(0)
 const formRef = ref<FormInstance>()
 const form = reactive<Omit<Element, 'id'>>(createEmptyElement())
 
@@ -108,6 +118,7 @@ const rules: FormRules = {
 
 function openCreate(sceneId?: string): void {
   editingId.value = null
+  editingRevision.value = 0
   Object.assign(form, createEmptyElement())
   const preset = sceneId ?? (typeof route.query.sceneIds === 'string' ? route.query.sceneIds.split(',')[0] : '')
   if (preset) form.sceneId = preset
@@ -117,6 +128,7 @@ function openCreate(sceneId?: string): void {
 
 function openEdit(element: ElementRow): void {
   editingId.value = element.id
+  editingRevision.value = element.revision
   Object.assign(form, {
     sceneId: element.sceneId,
     category: element.category,
@@ -131,33 +143,46 @@ function openEdit(element: ElementRow): void {
 async function submit(): Promise<void> {
   const valid = await formRef.value?.validate().catch(() => false)
   if (!valid) return
-  if (editingId.value) {
-    await store.updateElement(editingId.value, { ...form })
-    ElMessage.success('连戏要素已更新')
-  } else {
-    await store.createElement({ ...form })
-    ElMessage.success('连戏要素已登记')
+  try {
+    if (editingId.value) {
+      const result = await store.updateElement(editingId.value, { ...form }, editingRevision.value)
+      dialogVisible.value = false
+      ElMessage.success(result.baselineChanged ? '连戏要素已更新，要素基准已留档新版本' : '连戏要素已更新')
+    } else {
+      await store.createElement({ ...form })
+      dialogVisible.value = false
+      ElMessage.success('连戏要素已登记')
+    }
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '保存失败')
   }
-  dialogVisible.value = false
 }
 
 async function remove(element: ElementRow): Promise<void> {
   try {
     await ElMessageBox.confirm(
-      `删除要素「${element.name}」会同时删除其现场记录与差异条目，是否继续？`,
+      `删除要素「${element.name}」会同时删除其现场记录、差异条目与基准版本链，是否继续？`,
       '删除确认',
       { type: 'warning', confirmButtonText: '确认删除' }
     )
   } catch {
     return
   }
-  await store.deleteElement(element.id)
-  ElMessage.success('要素及其记录已删除')
+  try {
+    await store.deleteElement(element.id, element.revision)
+    ElMessage.success('要素及其记录已删除')
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '删除失败')
+  }
 }
 
 async function toggleCritical(element: ElementRow): Promise<void> {
-  await store.updateElement(element.id, { critical: !element.critical })
-  ElMessage.success(element.critical ? '已取消关键要素标记' : '已标记为关键要素')
+  try {
+    await store.updateElement(element.id, { critical: !element.critical }, element.revision)
+    ElMessage.success(element.critical ? '已取消关键要素标记' : '已标记为关键要素')
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '操作失败')
+  }
 }
 
 function gotoLog(element: ElementRow): void {
@@ -229,7 +254,38 @@ watch(
         </div>
         <el-table :data="categoryGroup.items" stripe border size="small">
           <el-table-column prop="name" label="要素名称" min-width="150" />
-          <el-table-column prop="initialState" label="初始状态（连戏基准）" min-width="220" />
+          <el-table-column label="初始状态（连戏基准）" min-width="240">
+            <template #default="{ row }">
+              <div>{{ row.initialState }}</div>
+              <el-popover placement="top" width="320" trigger="click">
+                <template #reference>
+                  <el-button link type="primary" size="small">
+                    基准版本 {{ baselineVersionsOf(row.id).length }} 代
+                  </el-button>
+                </template>
+                <div class="baseline-pop">
+                  <div class="baseline-pop__title">要素基准版本链</div>
+                  <el-timeline v-if="baselineVersionsOf(row.id).length > 0">
+                    <el-timeline-item
+                      v-for="version in baselineVersionsOf(row.id)"
+                      :key="version.id"
+                      :timestamp="new Date(version.createdAt).toLocaleString('zh-CN')"
+                      placement="top"
+                    >
+                      <div class="baseline-pop__head">
+                        <el-tag size="small" effect="plain">第 {{ version.version }} 代</el-tag>
+                        <el-tag size="small" :type="version.source === '差异回写' ? 'warning' : version.source === '初始登记' ? 'success' : 'info'">
+                          {{ version.source }}
+                        </el-tag>
+                      </div>
+                      <div class="baseline-pop__state">{{ version.state }}</div>
+                      <div v-if="version.note" class="muted baseline-pop__note">{{ version.note }}</div>
+                    </el-timeline-item>
+                  </el-timeline>
+                </div>
+              </el-popover>
+            </template>
+          </el-table-column>
           <el-table-column prop="owner" label="责任人" width="140" />
           <el-table-column label="关键" width="90">
             <template #default="{ row }">
@@ -300,5 +356,26 @@ watch(
   align-items: center;
   gap: 8px;
   margin-bottom: 8px;
+}
+
+.baseline-pop__title {
+  margin-bottom: 10px;
+  font-weight: 600;
+}
+
+.baseline-pop__head {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 4px;
+}
+
+.baseline-pop__state {
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.baseline-pop__note {
+  margin-top: 2px;
+  font-size: 12px;
 }
 </style>

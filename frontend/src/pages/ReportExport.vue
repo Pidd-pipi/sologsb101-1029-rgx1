@@ -24,13 +24,16 @@ const filters = ref<FilterModel>({ keyword: '' })
 const preview = ref('')
 
 const totals = computed(() => {
-  const open = conflicts.value.filter((item) => item.state === '待确认')
+  // 留档旧结论（待重算）不参与统计
+  const current = conflicts.value.filter((item) => item.state !== '待重算')
+  const open = current.filter((item) => item.state === '待确认')
   return {
-    total: conflicts.value.length,
+    total: current.length,
     open: open.length,
-    resolved: conflicts.value.filter((item) => item.state === '已解决').length,
+    resolved: current.filter((item) => item.state === '已解决').length,
     blocking: open.filter((item) => item.severity === '阻断').length,
-    risk: riskScore(open)
+    risk: riskScore(open),
+    archived: conflicts.value.filter((item) => item.state === '待重算').length
   }
 })
 
@@ -186,7 +189,8 @@ watch(filters, (value) => {
             <el-descriptions-item label="结构版本">v{{ DB_SCHEMA_VERSION }}</el-descriptions-item>
             <el-descriptions-item label="场次/要素">{{ dbCounts.scenes ?? 0 }} / {{ dbCounts.elements ?? 0 }}</el-descriptions-item>
             <el-descriptions-item label="拍摄日/记录">{{ dbCounts.shootDays ?? 0 }} / {{ dbCounts.records ?? 0 }}</el-descriptions-item>
-            <el-descriptions-item label="差异">{{ dbCounts.conflicts ?? 0 }}</el-descriptions-item>
+            <el-descriptions-item label="差异">{{ dbCounts.conflicts ?? 0 }}（留档 {{ totals.archived }}）</el-descriptions-item>
+            <el-descriptions-item label="记录/基准版本">{{ dbCounts.recordVersions ?? 0 }} / {{ dbCounts.baselineVersions ?? 0 }}</el-descriptions-item>
             <el-descriptions-item label="导出时间">{{ report?.exportedAt.slice(0, 19).replace('T', ' ') ?? '—' }}</el-descriptions-item>
           </el-descriptions>
           <div class="btn-row">

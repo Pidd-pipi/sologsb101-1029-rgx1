@@ -64,9 +64,10 @@ const dayRecords = computed(() =>
     .sort((a, b) => a.takeNo.localeCompare(b.takeNo, 'zh-Hans-CN'))
 )
 
-/** 该记录是否涉及未解决差异 */
+/** 该记录是否涉及差异：优先显示当前结论，其次留档旧结论（待重算） */
 function conflictOf(recordId: string): ConflictRow | null {
-  return conflicts.value.find((item) => item.recordIdA === recordId || item.recordIdB === recordId) ?? null
+  const related = conflicts.value.filter((item) => item.recordIdA === recordId || item.recordIdB === recordId)
+  return related.find((item) => item.state !== '待重算') ?? related[0] ?? null
 }
 
 const totals = computed(() => {
@@ -149,6 +150,8 @@ async function removeDay(day: ShootDayRow): Promise<void> {
 /* ------------------------------ 现场记录 ------------------------------ */
 const recordDialog = ref(false)
 const editingRecordId = ref<string | null>(null)
+/** 打开编辑时读到的行版本（乐观锁令牌，保存时原样带回） */
+const editingRecordRevision = ref<number>(0)
 const recordFormRef = ref<FormInstance>()
 const recordForm = reactive<Omit<ContinuityRecord, 'id'>>(createEmptyRecord())
 
@@ -164,6 +167,7 @@ function openCreateRecord(): void {
     return
   }
   editingRecordId.value = null
+  editingRecordRevision.value = 0
   Object.assign(recordForm, createEmptyRecord())
   recordForm.shootDayId = currentDay.value.id
   recordForm.recordedBy = currentDay.value.scripty
@@ -175,6 +179,7 @@ function openCreateRecord(): void {
 
 function openEditRecord(record: RecordRow): void {
   editingRecordId.value = record.id
+  editingRecordRevision.value = record.revision
   Object.assign(recordForm, {
     shootDayId: record.shootDayId,
     elementId: record.elementId,
@@ -200,13 +205,22 @@ async function submitRecord(): Promise<void> {
   if (!valid) return
   try {
     if (editingRecordId.value) {
-      await store.updateRecord(editingRecordId.value, { ...recordForm })
-      ElMessage.success('现场记录已更新')
+      const result = await store.updateRecord(editingRecordId.value, { ...recordForm }, editingRecordRevision.value)
+      recordDialog.value = false
+      if (result.affectedConflictCount > 0) {
+        ElMessage.warning(`现场记录已更新，${result.affectedConflictCount} 条相关差异已标记待重算，请到差异页确认`)
+      } else {
+        ElMessage.success('现场记录已更新')
+      }
     } else {
-      await store.createRecord({ ...recordForm })
-      ElMessage.success('现场记录已保存，可到差异页重新比对')
+      const result = await store.createRecord({ ...recordForm })
+      recordDialog.value = false
+      if (result.affectedConflictCount > 0) {
+        ElMessage.warning(`现场记录已保存，${result.affectedConflictCount} 条相关差异已标记待重算，请到差异页确认`)
+      } else {
+        ElMessage.success('现场记录已保存，可到差异页重新比对')
+      }
     }
-    recordDialog.value = false
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : '保存失败')
   }
@@ -218,8 +232,16 @@ async function removeRecord(record: RecordRow): Promise<void> {
   } catch {
     return
   }
-  await store.deleteRecord(record.id)
-  ElMessage.success('现场记录已删除')
+  try {
+    const result = await store.deleteRecord(record.id, record.revision)
+    if (result.affectedConflictCount > 0) {
+      ElMessage.warning(`现场记录已删除，${result.affectedConflictCount} 条相关差异已标记待重算`)
+    } else {
+      ElMessage.success('现场记录已删除')
+    }
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '删除失败')
+  }
 }
 
 function onFilterChange(next: FilterModel): void {

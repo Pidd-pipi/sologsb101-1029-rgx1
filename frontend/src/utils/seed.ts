@@ -3,8 +3,9 @@
  * 只在 scenes 表为空时执行。场次 → 连戏要素 → 拍摄日 → 现场记录 → 连戏差异 三层互相引用，
  * 并预留 1 条「阻断/待确认」与 1 条「轻微/待确认」差异，保证差异页与报告页有内容可看。
  */
-import type { SceneRow, ElementRow, ShootDayRow, RecordRow, ConflictRow } from './db'
+import type { SceneRow, ElementRow, ShootDayRow, RecordRow, ConflictRow, BaselineVersionRow } from './db'
 import { db, ROW_REVISION } from './db'
+import { createBaselineVersion } from '@/types/baselineVersion'
 
 function rev<T>(row: T): T & { revision: number; createdAt: number; updatedAt: number } {
   const now = Date.now()
@@ -146,43 +147,71 @@ const CONFLICTS: Array<Omit<ConflictRow, 'revision' | 'createdAt' | 'updatedAt'>
     elementId: 'el-001',
     recordIdA: 'rec-001',
     recordIdB: 'rec-004',
-    diffDesc: '当前状态：「深蓝风衣，第二颗扣子缺失」→「深蓝风衣，第三颗扣子缺失」',
+    diffDesc: '当前状态：「深蓝风衣，第二颗扣子缺失」→「深蓝风衣，第三颗扣子缺失」；照片说明：「正面全身」→「正面全身（补）」；镜次：「3/1」→「7/2」',
     severity: '阻断',
     state: '待确认',
     resolvedNote: '',
-    resolvedAt: ''
+    resolvedAt: '',
+    version: 1,
+    supersedes: '',
+    supersededBy: '',
+    recalcReason: '',
+    recalcDone: false
   },
   {
     id: 'cf-002',
     elementId: 'el-003',
     recordIdA: 'rec-003',
     recordIdB: 'rec-006',
-    diffDesc: '当前状态：「低盘发，右侧留碎发」→「高马尾，无碎发」',
+    diffDesc: '当前状态：「低盘发，右侧留碎发」→「高马尾，无碎发」；镜次：「3/1」→「7/2」',
     severity: '需处理',
     state: '已解决',
     resolvedNote: '已按第 7 场重新盘发并补拍侧脸特写',
-    resolvedAt: '2024-05-08T02:10:00.000Z'
+    resolvedAt: '2024-05-08T02:10:00.000Z',
+    version: 1,
+    supersedes: '',
+    supersededBy: '',
+    recalcReason: '',
+    recalcDone: false
   },
   {
     id: 'cf-003',
     elementId: 'el-002',
     recordIdA: 'rec-002',
     recordIdB: 'rec-005',
-    diffDesc: '照片说明：「台灯特写」→「台灯特写（第二次）」',
+    diffDesc: '照片说明：「台灯特写」→「台灯特写（第二次）」；镜次：「3/1」→「7/2」',
     severity: '轻微',
     state: '待确认',
     resolvedNote: '',
-    resolvedAt: ''
+    resolvedAt: '',
+    version: 1,
+    supersedes: '',
+    supersededBy: '',
+    recalcReason: '',
+    recalcDone: false
   }
 ]
 
-/** 灌入演示数据（场次 → 要素 → 拍摄日 → 现场记录 → 连戏差异） */
+/** 要素基准版本：每个要素初始登记第 1 代基准 */
+const BASELINE_VERSIONS: BaselineVersionRow[] = ELEMENTS.map((element, index) =>
+  createBaselineVersion(
+    element.id,
+    1,
+    element.initialState,
+    '初始登记',
+    { id: `bv-${String(index + 1).padStart(3, '0')}` },
+    Date.now()
+  )
+)
+
+/** 灌入演示数据（场次 → 要素 → 拍摄日 → 现场记录 → 连戏差异 → 要素基准版本） */
 export async function seedDatabase(): Promise<void> {
-  await db.transaction('rw', [db.scenes, db.elements, db.shootDays, db.records, db.conflicts], async () => {
+  await db.transaction('rw', [db.scenes, db.elements, db.shootDays, db.records, db.conflicts, db.baselineVersions], async () => {
     await db.scenes.bulkPut(SCENES.map(rev))
     await db.elements.bulkPut(ELEMENTS.map(rev))
     await db.shootDays.bulkPut(SHOOT_DAYS.map(rev))
     await db.records.bulkPut(RECORDS.map(rev))
     await db.conflicts.bulkPut(CONFLICTS.map(rev))
+    await db.baselineVersions.bulkPut(BASELINE_VERSIONS)
   })
 }
