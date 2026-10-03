@@ -1,26 +1,37 @@
 /**
  * 现场记录 store：维护现场记录与当前拍摄日上下文。
+ * 补记 / 更正旧记录统一走版本链动作 amendRecord：相关差异先冻结为待重算，确认重算后再生成。
  */
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import type { LocationQuery } from 'vue-router'
 import type { ShootDay } from '@/types/shootDay'
 import type { FilterModel } from '@/types/filter'
+import type { RecordRow } from '@/utils/db'
 import {
   nextShootOrder,
   putRecord,
   putShootDay,
   removeRecord,
   removeShootDay,
-  updateRecord as updateRecordRow,
   updateShootDay as updateShootDayRow,
+  INITIAL_VERSION,
   ROW_REVISION
 } from '@/utils/db'
+import { amendRecord } from '@/utils/versionChain'
 import { createId } from '@/utils/uuid'
 import { queryToFilters } from '@/utils/query'
 import type { Record as ContinuityRecord } from '@/types/record'
 
 export const RECORD_FILTER_KEYS = ['sceneIds', 'takes']
+
+export interface UpdateRecordPayload {
+  patch: Partial<ContinuityRecord>
+  /** 编辑表单打开时读取到的版本号（乐观锁） */
+  expectedVersion: number
+  /** 补记 / 更正原因（写入版本链留痕） */
+  reason: string
+}
 
 export const useRecordStore = defineStore('record', () => {
   const filters = ref<FilterModel>({ keyword: '', sceneIds: [], takes: [] })
@@ -71,12 +82,30 @@ export const useRecordStore = defineStore('record', () => {
     if (!payload.currentState.trim()) throw new Error('请填写当前状态')
     const now = Date.now()
     const id = createId('record')
-    await putRecord({ ...payload, id, revision: ROW_REVISION, createdAt: now, updatedAt: now })
+    const row: RecordRow = {
+      ...payload,
+      id,
+      version: INITIAL_VERSION,
+      revision: ROW_REVISION,
+      createdAt: now,
+      updatedAt: now
+    }
+    await putRecord(row)
     return id
   }
 
-  async function updateRecord(id: string, patch: Partial<ContinuityRecord>): Promise<void> {
-    await updateRecordRow(id, patch)
+  /**
+   * 补记 / 更正旧记录：写新版本，相关差异冻结为待重算。
+   * 版本冲突时抛 VersionConflictError（页面负责提示并载入最新版本）。
+   */
+  async function updateRecord(id: string, payload: UpdateRecordPayload): Promise<void> {
+    await amendRecord({
+      id,
+      patch: payload.patch,
+      expectedVersion: payload.expectedVersion,
+      reason: payload.reason,
+      actor: payload.patch.recordedBy?.trim() || '现场记录'
+    })
   }
 
   async function deleteRecord(id: string): Promise<void> {

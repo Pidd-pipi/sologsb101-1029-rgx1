@@ -2,7 +2,7 @@
 /** StatBadge：批次数、在罐量、平均糖度等计数与占比徽标 */
 import { computed } from 'vue'
 import type { Component } from 'vue'
-import { DataLine, Files, Grid, Histogram, PieChart, TrendCharts, WarningFilled } from '@element-plus/icons-vue'
+import { DataLine, Files, FolderOpened, Grid, Histogram, PieChart, RefreshRight, TrendCharts, WarningFilled } from '@element-plus/icons-vue'
 
 type BadgeTone = 'default' | 'primary' | 'success' | 'warning' | 'danger' | 'info'
 
@@ -35,9 +35,11 @@ const toneColor: Record<BadgeTone, string> = {
 const iconMap: Record<string, Component> = {
   DataLine,
   Files,
+  FolderOpened,
   Grid,
   Histogram,
   PieChart,
+  RefreshRight,
   TrendCharts,
   WarningFilled
 }

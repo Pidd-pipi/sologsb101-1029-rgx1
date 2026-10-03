@@ -11,6 +11,7 @@ import FilterBar from '@/components/common/FilterBar.vue'
 import { db, type ConflictRow, type ElementRow, type RecordRow, type SceneRow, type ShootDayRow } from '@/utils/db'
 import { useIdbTable } from '@/hooks/useIdbTable'
 import { useRecordStore } from '@/stores/recordStore'
+import { isVersionConflictError } from '@/utils/errors'
 import { createEmptyShootDay, type ShootDay } from '@/types/shootDay'
 import { createEmptyRecord, type Record as ContinuityRecord } from '@/types/record'
 import type { FilterSelectConfig, FilterModel } from '@/types/filter'
@@ -64,18 +65,27 @@ const dayRecords = computed(() =>
     .sort((a, b) => a.takeNo.localeCompare(b.takeNo, 'zh-Hans-CN'))
 )
 
-/** 该记录是否涉及未解决差异 */
+/** 该记录关联的差异（版本链下可能同时有已留档旧结论与新一代结论）：待重算优先提示 */
 function conflictOf(recordId: string): ConflictRow | null {
-  return conflicts.value.find((item) => item.recordIdA === recordId || item.recordIdB === recordId) ?? null
+  const linked = conflicts.value.filter((item) => item.recordIdA === recordId || item.recordIdB === recordId)
+  const priority: ConflictRow['state'][] = ['待重算', '待确认', '已解决', '已留档']
+  return (
+    priority
+      .map((state) => linked.find((item) => item.state === state))
+      .find((item): item is ConflictRow => Boolean(item)) ?? null
+  )
 }
 
 const totals = computed(() => {
+  // 仅「待确认」是未解决；待重算结论已冻结待重算、已留档仅供追溯，均不参与统计
   const open = conflicts.value.filter((item) => item.state === '待确认')
+  const stale = conflicts.value.filter((item) => item.state === '待重算')
   return {
     shootDayCount: shootDays.value.length,
     recordCount: records.value.length,
     dayRecordCount: dayRecords.value.length,
     openConflictCount: open.length,
+    staleConflictCount: stale.length,
     blockingCount: open.filter((item) => item.severity === '阻断').length,
     elementCount: elements.value.length
   }
@@ -149,6 +159,10 @@ async function removeDay(day: ShootDayRow): Promise<void> {
 /* ------------------------------ 现场记录 ------------------------------ */
 const recordDialog = ref(false)
 const editingRecordId = ref<string | null>(null)
+/** 编辑表单打开时的记录版本（乐观锁） */
+const editingVersion = ref(0)
+/** 补记 / 更正原因（写入版本链留痕） */
+const amendReason = ref('')
 const recordFormRef = ref<FormInstance>()
 const recordForm = reactive<Omit<ContinuityRecord, 'id'>>(createEmptyRecord())
 
@@ -164,6 +178,8 @@ function openCreateRecord(): void {
     return
   }
   editingRecordId.value = null
+  editingVersion.value = 0
+  amendReason.value = ''
   Object.assign(recordForm, createEmptyRecord())
   recordForm.shootDayId = currentDay.value.id
   recordForm.recordedBy = currentDay.value.scripty
@@ -175,6 +191,8 @@ function openCreateRecord(): void {
 
 function openEditRecord(record: RecordRow): void {
   editingRecordId.value = record.id
+  editingVersion.value = record.version
+  amendReason.value = ''
   Object.assign(recordForm, {
     shootDayId: record.shootDayId,
     elementId: record.elementId,
@@ -185,6 +203,20 @@ function openEditRecord(record: RecordRow): void {
     recordedBy: record.recordedBy
   })
   recordDialog.value = true
+}
+
+/** 版本冲突后载入库里最新版本继续编辑 */
+function reloadLatestRecord(latest: RecordRow): void {
+  editingVersion.value = latest.version
+  Object.assign(recordForm, {
+    shootDayId: latest.shootDayId,
+    elementId: latest.elementId,
+    sceneId: latest.sceneId,
+    takeNo: latest.takeNo,
+    currentState: latest.currentState,
+    photoNote: latest.photoNote,
+    recordedBy: latest.recordedBy
+  })
 }
 
 /** 选中要素后自动带出所属场次与初始状态，减少手填 */
@@ -198,16 +230,39 @@ function onElementChange(elementId: string): void {
 async function submitRecord(): Promise<void> {
   const valid = await recordFormRef.value?.validate().catch(() => false)
   if (!valid) return
+  if (editingRecordId.value && !amendReason.value.trim()) {
+    ElMessage.warning('请填写补记 / 更正原因，便于版本链追溯')
+    return
+  }
   try {
     if (editingRecordId.value) {
-      await store.updateRecord(editingRecordId.value, { ...recordForm })
-      ElMessage.success('现场记录已更新')
+      await store.updateRecord(editingRecordId.value, {
+        patch: { ...recordForm },
+        expectedVersion: editingVersion.value,
+        reason: amendReason.value.trim()
+      })
+      ElMessage.success('现场记录已更正，相关差异已标记待重算，确认后到差异页重新生成')
     } else {
       await store.createRecord({ ...recordForm })
       ElMessage.success('现场记录已保存，可到差异页重新比对')
     }
     recordDialog.value = false
   } catch (error) {
+    if (isVersionConflictError(error)) {
+      const latest = error.latest as RecordRow
+      try {
+        await ElMessageBox.confirm(
+          `另一个标签页刚保存了该记录（现为 v${latest.version}）。确定要放弃你手里的旧内容、载入最新版本吗？`,
+          '版本冲突',
+          { type: 'warning', confirmButtonText: '载入最新版本', cancelButtonText: '保留我的编辑' }
+        )
+        reloadLatestRecord(latest)
+        ElMessage.info('已载入最新版本，核对后可再次保存')
+      } catch {
+        ElMessage.warning('已保留你的编辑，未覆盖对方刚写入的状态')
+      }
+      return
+    }
     ElMessage.error(error instanceof Error ? error.message : '保存失败')
   }
 }
@@ -265,8 +320,9 @@ watch(currentDay, (day) => {
       <StatBadge label="拍摄日" :value="totals.shootDayCount" suffix="天" icon="Files" tone="primary" />
       <StatBadge label="现场记录" :value="totals.recordCount" suffix="条" icon="DataLine" tone="info" />
       <StatBadge label="当日记录" :value="totals.dayRecordCount" suffix="条" icon="Grid" tone="success" />
-      <StatBadge label="未解决冲突" :value="totals.openConflictCount" suffix="条" icon="WarningFilled" tone="danger" />
-      <StatBadge label="阻断级" :value="totals.blockingCount" suffix="条" icon="WarningFilled" tone="warning" />
+      <StatBadge label="待确认差异" :value="totals.openConflictCount" suffix="条" icon="WarningFilled" tone="danger" />
+      <StatBadge label="待重算" :value="totals.staleConflictCount" suffix="条" icon="RefreshRight" tone="warning" />
+      <StatBadge label="阻断级" :value="totals.blockingCount" suffix="条" icon="WarningFilled" tone="danger" />
     </div>
 
     <FilterBar
@@ -339,6 +395,15 @@ watch(currentDay, (day) => {
             description="在左侧选择一个拍摄日后即可录入当日现场记录。"
             :show-create="false"
           />
+          <el-alert
+            v-else-if="totals.staleConflictCount > 0"
+            class="stale-alert"
+            type="warning"
+            show-icon
+            :closable="false"
+            title="有旧记录被补记 / 更正，相关差异已冻结为「待重算」"
+            description="旧结论仅留档不参与统计，请前往「差异比对」页确认重算后再看新结论。"
+          />
           <EmptyPanel
             v-else-if="dayRecords.length === 0"
             title="当日还没有现场记录"
@@ -357,10 +422,15 @@ watch(currentDay, (day) => {
               <template #default="{ row }">{{ sceneLabel(row.sceneId) }}</template>
             </el-table-column>
             <el-table-column prop="takeNo" label="镜次" width="90" />
+            <el-table-column label="版本" width="70" align="center">
+              <template #default="{ row }">
+                <el-tag size="small" effect="plain" round>v{{ row.version }}</el-tag>
+              </template>
+            </el-table-column>
             <el-table-column prop="currentState" label="当前状态" min-width="200" />
             <el-table-column prop="photoNote" label="照片说明" min-width="150" />
             <el-table-column prop="recordedBy" label="记录人" width="100" />
-            <el-table-column label="差异" width="150">
+            <el-table-column label="差异 / 版本链" width="160">
               <template #default="{ row }">
                 <ConflictTag
                   v-if="conflictOf(row.id)"
@@ -407,7 +477,20 @@ watch(currentDay, (day) => {
       </template>
     </el-dialog>
 
-    <el-dialog v-model="recordDialog" :title="editingRecordId ? '编辑现场记录' : '录入现场记录'" width="580px">
+    <el-dialog
+      v-model="recordDialog"
+      :title="editingRecordId ? `编辑现场记录（当前 v${editingVersion}）` : '录入现场记录'"
+      width="580px"
+    >
+      <el-alert
+        v-if="editingRecordId"
+        class="stale-alert"
+        type="info"
+        :closable="false"
+        show-icon
+        title="补记 / 更正旧记录"
+        description="保存后该记录升一个版本，与之相关的差异先标记为待重算，确认重算后才生成新一代结论；另一个标签页若刚保存过，会提示版本冲突而不会互相覆盖。"
+      />
       <el-form ref="recordFormRef" :model="recordForm" :rules="recordRules" label-width="100px">
         <el-form-item label="连戏要素" prop="elementId">
           <el-select v-model="recordForm.elementId" class="full" placeholder="选择当日场次下的要素" @change="onElementChange">
@@ -431,6 +514,14 @@ watch(currentDay, (day) => {
         <el-form-item label="记录人">
           <el-input v-model="recordForm.recordedBy" />
         </el-form-item>
+        <el-form-item v-if="editingRecordId" label="更正原因" required>
+          <el-input
+            v-model="amendReason"
+            type="textarea"
+            :rows="2"
+            placeholder="如：白天镜次补记，第二颗扣实际缺失；差异将待重算"
+          />
+        </el-form-item>
       </el-form>
       <template #footer>
         <el-button @click="recordDialog = false">取消</el-button>
@@ -443,6 +534,10 @@ watch(currentDay, (day) => {
 <style scoped>
 .full {
   width: 100%;
+}
+
+.stale-alert {
+  margin-bottom: 12px;
 }
 
 .day-list {

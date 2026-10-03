@@ -8,9 +8,10 @@ import FilterBar from '@/components/common/FilterBar.vue'
 import StatBadge from '@/components/common/StatBadge.vue'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import ConflictTag from '@/components/common/ConflictTag.vue'
-import { db, countAll, exportSnapshot, importSnapshot, resetDatabase, DB_NAME, DB_SCHEMA_VERSION, type ConflictRow } from '@/utils/db'
+import { db, countAll, exportSnapshot, importSnapshot, resetDatabase, DB_NAME, DB_SCHEMA_VERSION, type ConflictRow, type ChainRevisionRow } from '@/utils/db'
 import { useIdbTable } from '@/hooks/useIdbTable'
 import { buildReport, downloadJson, parseReport, riskScore, serializeReport, type ContinuityReport } from '@/utils/export'
+import { CHAIN_ACTION_LABELS, CHAIN_ENTITY_LABELS } from '@/types/chainRevision'
 import type { FilterModel } from '@/types/filter'
 import { filtersToQuery } from '@/utils/query'
 
@@ -18,21 +19,32 @@ const route = useRoute()
 const router = useRouter()
 
 const { rows: conflicts } = useIdbTable<ConflictRow>(() => db.conflicts)
+const { rows: chainRevisions } = useIdbTable<ChainRevisionRow>(() => db.chainRevisions)
 const report = ref<ContinuityReport | null>(null)
 const dbCounts = ref<Record<string, number>>({})
 const filters = ref<FilterModel>({ keyword: '' })
 const preview = ref('')
 
 const totals = computed(() => {
+  // 待重算（冻结）、已留档（归档）不参与统计
   const open = conflicts.value.filter((item) => item.state === '待确认')
   return {
-    total: conflicts.value.length,
+    activeTotal: conflicts.value.filter((item) => item.state === '待确认' || item.state === '已解决').length,
     open: open.length,
     resolved: conflicts.value.filter((item) => item.state === '已解决').length,
     blocking: open.filter((item) => item.severity === '阻断').length,
-    risk: riskScore(open)
+    stale: conflicts.value.filter((item) => item.state === '待重算').length,
+    archived: conflicts.value.filter((item) => item.state === '已留档').length,
+    risk: riskScore(conflicts.value)
   }
 })
+
+/** 最近版本链事件（报告页留痕追溯） */
+const recentChain = computed(() => chainRevisions.value.slice(0, 12))
+
+function chainTime(createdAt: number): string {
+  return new Date(createdAt).toISOString().slice(0, 19).replace('T', ' ')
+}
 
 const rows = computed(() => {
   const list = report.value?.summary.rows ?? []
@@ -121,10 +133,11 @@ watch(filters, (value) => {
     </div>
 
     <div class="badge-row">
-      <StatBadge label="差异条目" :value="totals.total" suffix="条" icon="Files" tone="primary" />
+      <StatBadge label="生效差异" :value="totals.activeTotal" suffix="条" icon="Files" tone="primary" />
       <StatBadge label="未解决" :value="totals.open" suffix="条" icon="WarningFilled" tone="danger" />
       <StatBadge label="已解决" :value="totals.resolved" suffix="条" icon="Grid" tone="success" />
       <StatBadge label="阻断级" :value="totals.blocking" suffix="条" icon="WarningFilled" tone="warning" />
+      <StatBadge label="待重算" :value="totals.stale" suffix="条" icon="RefreshRight" tone="danger" />
       <StatBadge label="风险分" :value="totals.risk" suffix="分" icon="TrendCharts" tone="info" />
     </div>
 
@@ -187,6 +200,7 @@ watch(filters, (value) => {
             <el-descriptions-item label="场次/要素">{{ dbCounts.scenes ?? 0 }} / {{ dbCounts.elements ?? 0 }}</el-descriptions-item>
             <el-descriptions-item label="拍摄日/记录">{{ dbCounts.shootDays ?? 0 }} / {{ dbCounts.records ?? 0 }}</el-descriptions-item>
             <el-descriptions-item label="差异">{{ dbCounts.conflicts ?? 0 }}</el-descriptions-item>
+            <el-descriptions-item label="版本链留痕">{{ dbCounts.chainRevisions ?? 0 }} 条</el-descriptions-item>
             <el-descriptions-item label="导出时间">{{ report?.exportedAt.slice(0, 19).replace('T', ' ') ?? '—' }}</el-descriptions-item>
           </el-descriptions>
           <div class="btn-row">
@@ -205,6 +219,46 @@ watch(filters, (value) => {
         </el-card>
       </el-col>
     </el-row>
+
+    <el-card shadow="never" class="chain-card">
+      <template #header>
+        <div class="card-title">
+          <span>版本链留痕（现场记录 → 连戏差异 → 要素基准）</span>
+          <span class="muted">最近 {{ recentChain.length }} 条 · 已留档 / 待重算差异不参与统计</span>
+        </div>
+      </template>
+      <EmptyPanel
+        v-if="recentChain.length === 0"
+        title="还没有版本链事件"
+        description="补记旧记录、确认重算或解决差异后，这里会留下可追溯的版本链记录。"
+        :show-create="false"
+      />
+      <el-table v-else :data="recentChain" border stripe size="small">
+        <el-table-column label="时间" width="170">
+          <template #default="{ row }">{{ chainTime(row.createdAt) }}</template>
+        </el-table-column>
+        <el-table-column label="动作" width="170">
+          <template #default="{ row }">
+            <el-tag size="small" effect="plain">
+              {{ CHAIN_ACTION_LABELS[row.eventType as keyof typeof CHAIN_ACTION_LABELS] ?? row.eventType }}
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="对象" width="110">
+          <template #default="{ row }">
+            {{ CHAIN_ENTITY_LABELS[row.entityType as keyof typeof CHAIN_ENTITY_LABELS] ?? row.entityType }}
+          </template>
+        </el-table-column>
+        <el-table-column prop="reason" label="原因 / 说明" min-width="220" />
+        <el-table-column prop="actor" label="操作人" width="110" />
+        <el-table-column label="版本" width="110">
+          <template #default="{ row }">
+            <span v-if="row.fromVersion || row.toVersion">v{{ row.fromVersion ?? '—' }} → v{{ row.toVersion ?? '—' }}</span>
+            <span v-else class="muted">—</span>
+          </template>
+        </el-table-column>
+      </el-table>
+    </el-card>
   </div>
 </template>
 
@@ -214,5 +268,9 @@ watch(filters, (value) => {
   flex-wrap: wrap;
   gap: 8px;
   margin-top: 12px;
+}
+
+.chain-card {
+  margin-top: 16px;
 }
 </style>

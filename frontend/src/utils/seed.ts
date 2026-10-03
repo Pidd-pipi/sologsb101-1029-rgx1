@@ -4,11 +4,25 @@
  * 并预留 1 条「阻断/待确认」与 1 条「轻微/待确认」差异，保证差异页与报告页有内容可看。
  */
 import type { SceneRow, ElementRow, ShootDayRow, RecordRow, ConflictRow } from './db'
-import { db, ROW_REVISION } from './db'
+import { db, conflictChainGroup, ROW_REVISION } from './db'
 
 function rev<T>(row: T): T & { revision: number; createdAt: number; updatedAt: number } {
   const now = Date.now()
   return { ...row, revision: ROW_REVISION, createdAt: now, updatedAt: now }
+}
+
+/** 演示数据中的记录与要素均为 v1；差异补齐版本链世代字段 */
+function conflictChainFields(row: SeedConflict): Omit<ConflictRow, 'revision' | 'createdAt' | 'updatedAt'> {
+  return {
+    ...row,
+    chainGroup: conflictChainGroup(row.elementId, row.recordIdA, row.recordIdB),
+    generation: 1,
+    recordAVersion: 1,
+    recordBVersion: 1,
+    baselineVersion: 1,
+    supersededBy: '',
+    preRecalcSnapshot: ''
+  }
 }
 
 const SCENES: Array<Omit<SceneRow, 'revision' | 'createdAt' | 'updatedAt'>> = [
@@ -44,7 +58,24 @@ const SCENES: Array<Omit<SceneRow, 'revision' | 'createdAt' | 'updatedAt'>> = [
   }
 ]
 
-const ELEMENTS: Array<Omit<ElementRow, 'revision' | 'createdAt' | 'updatedAt'>> = [
+/** 种子行：版本链字段在灌入时由映射统一补齐 */
+type SeedElement = Omit<ElementRow, 'revision' | 'createdAt' | 'updatedAt' | 'version'>
+type SeedRecord = Omit<RecordRow, 'revision' | 'createdAt' | 'updatedAt' | 'version'>
+type SeedConflict = Omit<
+  ConflictRow,
+  | 'revision'
+  | 'createdAt'
+  | 'updatedAt'
+  | 'chainGroup'
+  | 'generation'
+  | 'recordAVersion'
+  | 'recordBVersion'
+  | 'baselineVersion'
+  | 'supersededBy'
+  | 'preRecalcSnapshot'
+>
+
+const ELEMENTS: SeedElement[] = [
   {
     id: 'el-001',
     sceneId: 'sc-001',
@@ -128,7 +159,7 @@ const SHOOT_DAYS: Array<Omit<ShootDayRow, 'revision' | 'createdAt' | 'updatedAt'
   }
 ]
 
-const RECORDS: Array<Omit<RecordRow, 'revision' | 'createdAt' | 'updatedAt'>> = [
+const RECORDS: SeedRecord[] = [
   { id: 'rec-001', shootDayId: 'sd-001', elementId: 'el-001', sceneId: 'sc-001', takeNo: '3/1', currentState: '深蓝风衣，第二颗扣子缺失', photoNote: '正面全身', recordedBy: '苏晚' },
   { id: 'rec-002', shootDayId: 'sd-001', elementId: 'el-002', sceneId: 'sc-001', takeNo: '3/1', currentState: '铜制台灯，灯罩左下有裂纹', photoNote: '台灯特写', recordedBy: '苏晚' },
   { id: 'rec-003', shootDayId: 'sd-001', elementId: 'el-003', sceneId: 'sc-001', takeNo: '3/1', currentState: '低盘发，右侧留碎发', photoNote: '侧脸发际', recordedBy: '苏晚' },
@@ -140,7 +171,7 @@ const RECORDS: Array<Omit<RecordRow, 'revision' | 'createdAt' | 'updatedAt'>> = 
   { id: 'rec-009', shootDayId: 'sd-003', elementId: 'el-005', sceneId: 'sc-002', takeNo: '9/1', currentState: '深灰夹克，左袖有油污', photoNote: '男主半身', recordedBy: '苏晚' }
 ]
 
-const CONFLICTS: Array<Omit<ConflictRow, 'revision' | 'createdAt' | 'updatedAt'>> = [
+const CONFLICTS: SeedConflict[] = [
   {
     id: 'cf-001',
     elementId: 'el-001',
@@ -178,11 +209,11 @@ const CONFLICTS: Array<Omit<ConflictRow, 'revision' | 'createdAt' | 'updatedAt'>
 
 /** 灌入演示数据（场次 → 要素 → 拍摄日 → 现场记录 → 连戏差异） */
 export async function seedDatabase(): Promise<void> {
-  await db.transaction('rw', [db.scenes, db.elements, db.shootDays, db.records, db.conflicts], async () => {
+  await db.transaction('rw', [db.scenes, db.elements, db.shootDays, db.records, db.conflicts, db.chainRevisions], async () => {
     await db.scenes.bulkPut(SCENES.map(rev))
-    await db.elements.bulkPut(ELEMENTS.map(rev))
+    await db.elements.bulkPut(ELEMENTS.map((item) => ({ ...item, version: 1 })).map(rev))
     await db.shootDays.bulkPut(SHOOT_DAYS.map(rev))
-    await db.records.bulkPut(RECORDS.map(rev))
-    await db.conflicts.bulkPut(CONFLICTS.map(rev))
+    await db.records.bulkPut(RECORDS.map((item) => ({ ...item, version: 1 })).map(rev))
+    await db.conflicts.bulkPut(CONFLICTS.map(conflictChainFields).map(rev))
   })
 }

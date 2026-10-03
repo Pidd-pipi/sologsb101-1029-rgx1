@@ -7,8 +7,19 @@ import type { Element } from '../types/element'
 import type { ShootDay } from '../types/shootDay'
 import type { Record as ContinuityRecord } from '../types/record'
 import type { Conflict } from '../types/conflict'
+import type { ChainRevision } from '../types/chainRevision'
+import { ACTIVE_CONFLICT_STATES } from '../types/conflict'
 import { SEVERITY_WEIGHT } from './diff'
-import { DB_NAME, DB_SCHEMA_VERSION, listConflicts, listElements, listRecords, listScenes, listShootDays } from './db'
+import {
+  DB_NAME,
+  DB_SCHEMA_VERSION,
+  listConflicts,
+  listElements,
+  listRecords,
+  listScenes,
+  listShootDays,
+  listChainRevisions
+} from './db'
 import { nowIso } from './uuid'
 
 /** 单个场次的核对小结 */
@@ -36,6 +47,8 @@ export interface ContinuityReport {
   shootDays: ShootDay[]
   records: ContinuityRecord[]
   conflicts: Conflict[]
+  /** 版本链留痕（修订 / 失效 / 重算 / 归档 / 解决 / 回滚） */
+  chainRevisions: ChainRevision[]
   summary: {
     sceneCount: number
     elementCount: number
@@ -43,6 +56,10 @@ export interface ContinuityReport {
     openConflictCount: number
     blockedConflictCount: number
     resolvedConflictCount: number
+    /** 待重算（冻结，不参与统计） */
+    staleConflictCount: number
+    /** 已留档（不参与统计） */
+    archivedConflictCount: number
     /** 未解决冲突最多的场次 */
     riskiestSceneNo: string
     rows: SceneReportRow[]
@@ -61,18 +78,20 @@ function stripRevision<T extends WithRevision>(row: T): T {
 
 /** 汇总整份连戏核对报告 */
 export async function buildReport(): Promise<ContinuityReport> {
-  const [scenes, elements, shootDays, records, conflicts] = await Promise.all([
+  const [scenes, elements, shootDays, records, conflicts, chainRevisions] = await Promise.all([
     listScenes(),
     listElements(),
     listShootDays(),
     listRecords(),
-    listConflicts()
+    listConflicts(),
+    listChainRevisions()
   ])
 
   const rows: SceneReportRow[] = scenes.map((scene) => {
     const sceneElements = elements.filter((item) => item.sceneId === scene.id)
     const elementIds = sceneElements.map((item) => item.id)
-    const sceneConflicts = conflicts.filter((item) => elementIds.includes(item.elementId))
+    // 统计口径：待重算（冻结）与已留档（归档）不参与统计
+    const sceneConflicts = conflicts.filter((item) => elementIds.includes(item.elementId) && ACTIVE_CONFLICT_STATES.includes(item.state))
     return {
       sceneId: scene.id,
       sceneNo: scene.sceneNo,
@@ -103,6 +122,7 @@ export async function buildReport(): Promise<ContinuityReport> {
     shootDays: shootDays.map(stripRevision),
     records: records.map(stripRevision),
     conflicts: conflicts.map(stripRevision),
+    chainRevisions: chainRevisions.map(stripRevision),
     summary: {
       sceneCount: scenes.length,
       elementCount: elements.length,
@@ -110,15 +130,19 @@ export async function buildReport(): Promise<ContinuityReport> {
       openConflictCount: openConflicts.length,
       blockedConflictCount: openConflicts.filter((item) => item.severity === '阻断').length,
       resolvedConflictCount: conflicts.filter((item) => item.state === '已解决').length,
+      staleConflictCount: conflicts.filter((item) => item.state === '待重算').length,
+      archivedConflictCount: conflicts.filter((item) => item.state === '已留档').length,
       riskiestSceneNo: riskiest ? riskiest.sceneNo : '—',
       rows
     }
   }
 }
 
-/** 严重程度加权后的风险分：用于报告页排序 */
+/** 严重程度加权后的风险分：只统计生效的未解决差异（待重算 / 已留档不计） */
 export function riskScore(conflicts: Conflict[]): number {
-  return conflicts.reduce((sum, item) => sum + SEVERITY_WEIGHT[item.severity], 0)
+  return conflicts
+    .filter((item) => item.state === '待确认')
+    .reduce((sum, item) => sum + SEVERITY_WEIGHT[item.severity], 0)
 }
 
 export function serializeReport(report: ContinuityReport): string {

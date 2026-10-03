@@ -44,7 +44,7 @@ docker compose up -d --build      # 代码改动后重新构建
 | 构建工具 | Vite 6 | 开发服务器端口 22829 |
 | 状态管理 | Pinia（setup store） | `sceneStore` / `elementStore` / `recordStore` / `conflictStore` |
 | 路由 | Vue Router 4（history 模式） | nginx 侧配合 `try_files` 做 SPA fallback |
-| 本地存储 | Dexie 4（IndexedDB 封装） | 库名 `gbcontinuity-db`，含结构版本号与 upgrade 迁移 |
+| 本地存储 | Dexie 4（IndexedDB 封装） | 库名 `gbcontinuity-db`，结构版本 `version(2)` 含 upgrade 迁移；六张表含版本链留痕 |
 | 容器化 | Docker 多阶段构建：`node:20-alpine` → `nginx:alpine` | 构建阶段执行类型检查与打包，运行阶段仅托管静态产物 |
 
 ---
@@ -93,7 +93,7 @@ sologsb101-1029/
         ├── stores/             # sceneStore elementStore recordStore conflictStore
         ├── components/common/  # ConflictTag.vue FilterBar.vue StatBadge.vue EmptyPanel.vue
         ├── hooks/              # useContinuityDiff.ts useIdbTable.ts
-        ├── utils/              # diff.ts db.ts export.ts seed.ts uuid.ts query.ts
+        ├── utils/              # diff.ts db.ts export.ts versionChain.ts errors.ts seed.ts uuid.ts query.ts
         ├── pages/              # SceneList ElementRegistry ShootDayLog ConflictBoard ReportExport
         ├── styles/main.css
         └── router/index.ts
@@ -103,9 +103,10 @@ sologsb101-1029/
 
 ## 六、数据存储说明
 
-- **IndexedDB 库名**：`gbcontinuity-db`（Dexie 封装），结构版本号 `version(1)`，并带 `upgrade()` 迁移逻辑（为历史行补齐行修订号与时间戳）。
-- **分表存储**：`scenes` 场次、`elements` 连戏要素、`shootDays` 拍摄日、`records` 现场记录、`conflicts` 连戏差异，共 5 张表；每行带 `revision` / `createdAt` / `updatedAt`。
+- **IndexedDB 库名**：`gbcontinuity-db`，结构版本号 `version(2)`，并带 `upgrade()` 迁移逻辑（v1→v2 为现场记录 / 要素补乐观版本号、为差异补版本链世代字段）。
+- **分表存储**：`scenes` 场次、`elements` 连戏要素、`shootDays` 拍摄日、`records` 现场记录、`conflicts` 连戏差异、`chainRevisions` 版本链留痕，共 6 张表；业务行带 `revision` / `createdAt` / `updatedAt`，现场记录与要素额外带 `version`。
 - **首屏自动播种**：`utils/db.ts` 的 `initDatabase()` 在 `scenes` 表为空时调用 `seedDatabase()`，灌入互相引用的三层演示数据（场次 → 连戏要素 → 拍摄日 → 现场记录 → 差异），其中包含 1 条「阻断 / 待确认」与 1 条「轻微 / 待确认」差异，保证差异页与报告页首次打开就有内容；播种幂等。
 - **差异算法**：`utils/diff.ts` 对状态文本做归一化（去掉空白与标点、颜色/款式同义写法归组，如「藏青 / 深蓝」视为同一色），归一后仍有差异才生成条目；关键要素的状态变化判为「阻断」，一般要素的状态变化判为「需处理」，仅照片说明 / 镜次变化判为「轻微」。
+- **版本链（现场记录 → 连戏差异 → 要素基准）**：差异状态有「待确认 / 已解决 / 待重算 / 已留档」四态。补记或更正旧记录、修改要素基准（初始状态 / 关键标记）时，记录或基准的 `version` 递增，相关差异在同一事务内冻结为「待重算」并保存动手前快照；在差异页「确认重算」后旧差异转为「已留档」（留档但**不参与统计**），并按最近两次记录生成新一代差异；重算任一步失败则按快照把记录、基准与差异恢复到动手前。两个标签页同时编辑同一要素 / 记录时，保存按 `version` 做乐观校验，后保存方收到版本冲突提示并可载入最新版本，不会覆盖对方刚写入的状态。全部修订 / 失效 / 重算 / 归档 / 解决 / 回滚动作写入 `chainRevisions` 留痕，报告页可追溯。
 - **无后端**：没有 API 服务、没有数据库容器；容器本身无状态，不挂载任何卷。
-- **级联规则**：删除场次会级联删除其要素、现场记录与相关差异；删除拍摄日会删除当日记录与相关差异。
+- **级联规则**：删除场次会级联删除其要素、现场记录与相关差异；删除拍摄日会删除当日记录与相关差异（版本链留痕保留以备审计）。

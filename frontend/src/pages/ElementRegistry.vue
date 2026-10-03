@@ -10,6 +10,7 @@ import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import { db, type ElementRow, type RecordRow, type SceneRow } from '@/utils/db'
 import { useIdbTable } from '@/hooks/useIdbTable'
 import { useElementStore } from '@/stores/elementStore'
+import { isVersionConflictError } from '@/utils/errors'
 import { ELEMENT_CATEGORIES, createEmptyElement, type Element, type ElementCategory } from '@/types/element'
 import type { FilterSelectConfig, FilterModel } from '@/types/filter'
 import { filtersToQuery } from '@/utils/query'
@@ -97,6 +98,10 @@ const totals = computed(() => {
 /* ------------------------------ 新增 / 编辑 ------------------------------ */
 const dialogVisible = ref(false)
 const editingId = ref<string | null>(null)
+/** 编辑表单打开时的要素版本（乐观锁） */
+const editingVersion = ref(0)
+/** 基准修改原因（写入版本链留痕） */
+const amendReason = ref('')
 const formRef = ref<FormInstance>()
 const form = reactive<Omit<Element, 'id'>>(createEmptyElement())
 
@@ -108,6 +113,8 @@ const rules: FormRules = {
 
 function openCreate(sceneId?: string): void {
   editingId.value = null
+  editingVersion.value = 0
+  amendReason.value = ''
   Object.assign(form, createEmptyElement())
   const preset = sceneId ?? (typeof route.query.sceneIds === 'string' ? route.query.sceneIds.split(',')[0] : '')
   if (preset) form.sceneId = preset
@@ -117,6 +124,8 @@ function openCreate(sceneId?: string): void {
 
 function openEdit(element: ElementRow): void {
   editingId.value = element.id
+  editingVersion.value = element.version
+  amendReason.value = ''
   Object.assign(form, {
     sceneId: element.sceneId,
     category: element.category,
@@ -128,17 +137,52 @@ function openEdit(element: ElementRow): void {
   dialogVisible.value = true
 }
 
+function reloadLatestElement(latest: ElementRow): void {
+  editingVersion.value = latest.version
+  Object.assign(form, {
+    sceneId: latest.sceneId,
+    category: latest.category,
+    name: latest.name,
+    initialState: latest.initialState,
+    owner: latest.owner,
+    critical: latest.critical
+  })
+}
+
 async function submit(): Promise<void> {
   const valid = await formRef.value?.validate().catch(() => false)
   if (!valid) return
-  if (editingId.value) {
-    await store.updateElement(editingId.value, { ...form })
-    ElMessage.success('连戏要素已更新')
-  } else {
-    await store.createElement({ ...form })
-    ElMessage.success('连戏要素已登记')
+  try {
+    if (editingId.value) {
+      await store.updateElement(editingId.value, {
+        patch: { ...form },
+        expectedVersion: editingVersion.value,
+        reason: amendReason.value.trim() || '连戏要素被修改'
+      })
+      ElMessage.success('连戏要素已更新；基准变化时相关差异已标记待重算')
+    } else {
+      await store.createElement({ ...form })
+      ElMessage.success('连戏要素已登记')
+    }
+    dialogVisible.value = false
+  } catch (error) {
+    if (isVersionConflictError(error)) {
+      const latest = error.latest as ElementRow
+      try {
+        await ElMessageBox.confirm(
+          `另一个标签页刚保存了该要素（现为 v${latest.version}）。确定放弃你手里的旧内容、载入最新版本吗？`,
+          '版本冲突',
+          { type: 'warning', confirmButtonText: '载入最新版本', cancelButtonText: '保留我的编辑' }
+        )
+        reloadLatestElement(latest)
+        ElMessage.info('已载入最新版本，核对后可再次保存')
+      } catch {
+        ElMessage.warning('已保留你的编辑，未覆盖对方刚写入的基准')
+      }
+      return
+    }
+    ElMessage.error(error instanceof Error ? error.message : '保存失败')
   }
-  dialogVisible.value = false
 }
 
 async function remove(element: ElementRow): Promise<void> {
@@ -156,8 +200,20 @@ async function remove(element: ElementRow): Promise<void> {
 }
 
 async function toggleCritical(element: ElementRow): Promise<void> {
-  await store.updateElement(element.id, { critical: !element.critical })
-  ElMessage.success(element.critical ? '已取消关键要素标记' : '已标记为关键要素')
+  try {
+    await store.updateElement(element.id, {
+      patch: { critical: !element.critical },
+      expectedVersion: element.version,
+      reason: element.critical ? '取消关键要素标记' : '标记为关键要素'
+    })
+    ElMessage.success(element.critical ? '已取消关键要素标记，相关差异待重算' : '已标记为关键要素，相关差异待重算')
+  } catch (error) {
+    if (isVersionConflictError(error)) {
+      ElMessage.error('要素刚被其他标签页修改，请刷新列表后再操作')
+      return
+    }
+    ElMessage.error(error instanceof Error ? error.message : '操作失败')
+  }
 }
 
 function gotoLog(element: ElementRow): void {
@@ -230,6 +286,11 @@ watch(
         <el-table :data="categoryGroup.items" stripe border size="small">
           <el-table-column prop="name" label="要素名称" min-width="150" />
           <el-table-column prop="initialState" label="初始状态（连戏基准）" min-width="220" />
+          <el-table-column label="基准版本" width="90" align="center">
+            <template #default="{ row }">
+              <el-tag size="small" effect="plain" round>v{{ row.version }}</el-tag>
+            </template>
+          </el-table-column>
           <el-table-column prop="owner" label="责任人" width="140" />
           <el-table-column label="关键" width="90">
             <template #default="{ row }">
@@ -253,7 +314,20 @@ watch(
       </div>
     </el-card>
 
-    <el-dialog v-model="dialogVisible" :title="editingId ? '编辑连戏要素' : '新增连戏要素'" width="560px">
+    <el-dialog
+      v-model="dialogVisible"
+      :title="editingId ? `编辑连戏要素（基准 v${editingVersion}）` : '新增连戏要素'"
+      width="560px"
+    >
+      <el-alert
+        v-if="editingId"
+        class="stale-alert"
+        type="info"
+        :closable="false"
+        show-icon
+        title="修改初始状态 / 关键标记属于基准变更"
+        description="保存后基准升版，相关差异先冻结为待重算；另一个标签页若刚保存过，会提示版本冲突而不会互相覆盖。"
+      />
       <el-form ref="formRef" :model="form" :rules="rules" label-width="110px">
         <el-form-item label="所属场次" prop="sceneId">
           <el-select v-model="form.sceneId" class="full" placeholder="选择场次">
@@ -277,6 +351,9 @@ watch(
         <el-form-item label="关键要素">
           <el-switch v-model="form.critical" active-text="关键（差异按阻断处理）" />
         </el-form-item>
+        <el-form-item v-if="editingId" label="修改原因">
+          <el-input v-model="amendReason" type="textarea" :rows="2" placeholder="如：经导演确认基准更正；相关差异将待重算" />
+        </el-form-item>
       </el-form>
       <template #footer>
         <el-button @click="dialogVisible = false">取消</el-button>
@@ -289,6 +366,10 @@ watch(
 <style scoped>
 .full {
   width: 100%;
+}
+
+.stale-alert {
+  margin-bottom: 12px;
 }
 
 .category-block {
